@@ -10,7 +10,7 @@ function sse(type, payload) {
   return `event: ${type}\ndata: ${JSON.stringify(payload)}\n\n`
 }
 
-function responseFrom(text, chunkSize = 7) {
+function responseFrom(text, headers = { 'content-type': 'text/event-stream' }, chunkSize = 7) {
   const bytes = new TextEncoder().encode(text)
   const stream = new ReadableStream({
     start(controller) {
@@ -20,16 +20,17 @@ function responseFrom(text, chunkSize = 7) {
       controller.close()
     },
   })
-  return new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+  return new Response(stream, { status: 200, headers })
 }
 
 const originalFetch = globalThis.fetch
+globalThis.__fixture = ''
+globalThis.__headers = { 'content-type': 'text/event-stream' }
 globalThis.fetch = async (input) => {
   const url = typeof input === 'string' ? input : input.url
   if (!url.includes('/messages')) return originalFetch(input)
-  return responseFrom(globalThis.__fixture)
+  return responseFrom(globalThis.__fixture, globalThis.__headers)
 }
-globalThis.__fixture = ''
 
 const plugin = await import('../lib/index.js')
 plugin.apply({})
@@ -114,12 +115,23 @@ globalThis.__fixture =
   assert.equal(raw, globalThis.__fixture, 'E: 正常流必须字节级透传')
 }
 
-// F. 非 SSE / 非 messages 端点不处理
+// F. 非 SSE 正文（JSON 错误体）在不带 content-type 时也要原样透传
+globalThis.__headers = {}
+globalThis.__fixture = '{"error":{"message":"rate limited"}}'
 {
-  globalThis.fetch = async () =>
-    new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } })
-  const out = await (await fetch(URL_MESSAGES)).text()
-  assert.equal(out, '{"ok":true}', 'F: 非 SSE 响应不能被包装')
+  const raw = await collect()
+  assert.equal(raw, globalThis.__fixture, 'F: 非 SSE 正文不能被改写')
 }
 
-console.log('ALL OK — 6 cases')
+// G. 200 但**没有 content-type**（实测失败响应就长这样）→ 仍要归一化
+globalThis.__headers = {}
+globalThis.__fixture =
+  sse('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }) +
+  sse('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'x' } }) +
+  sse('content_block_stop', { type: 'content_block_stop', index: 0 })
+{
+  const out = frames(await collect())
+  assert.equal(out[0].type, 'message_start', 'G: 无 content-type 也要补 message_start')
+}
+
+console.log('ALL OK — 7 cases')
